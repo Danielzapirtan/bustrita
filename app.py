@@ -1,111 +1,99 @@
 import gradio as gr
 import requests
-import json
 
-# Coordonatele aproximative pentru orașul Bistrița (pentru a limita căutarea la zonă relevantă)
-BISTRITA_BBOX = "47.08,24.42,47.18,24.58"  # south, west, north, east
+def fetch_stops():
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = '''
+    [out:json][timeout:25];
+    area["name"="Bistrița"]["admin_level"="8"]->.searchArea;
+    node(area.searchArea)["highway"="bus_stop"]["name"];
+    out body;
+    '''
+    response = requests.post(overpass_url, data={'data': query})
+    
+    if response.status_code != 200:
+        return []
+    
+    data = response.json()
+    names = set()
+    
+    for elem in data['elements']:
+        name = elem['tags'].get('name')
+        if name:
+            names.add(name)
+    
+    return sorted(names)
 
-# Query Overpass API pentru toate stațiile de autobuz din Bistrița
-# Folosim atât tag-ul clasic highway=bus_stop, cât și public_transport=platform cu bus=yes
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-QUERY = f"""
-[out:json];
-(
-  node["highway"="bus_stop"]({BISTRITA_BBOX});
-  node["public_transport"="platform"]["bus"="yes"]({BISTRITA_BBOX});
-);
-out body;
-"""
+stops_list = fetch_stops()
 
-response = requests.get(OVERPASS_URL, params={'data': QUERY})
-data = response.json()
+def find_route(from_stop, to_stop):
+    if from_stop == to_stop:
+        return "Stațiile de plecare și sosire sunt identice."
+    
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = '''
+    [out:json][timeout:25];
+    area["name"="Bistrița"]["admin_level"="8"]->.searchArea;
+    rel(area.searchArea)["type"="route"]["route"="bus"];
+    out body;
+    >;
+    out skel qt;
+    '''
+    
+    response = requests.post(overpass_url, data={'data': query})
+    
+    if response.status_code != 200:
+        return "A apărut o eroare la interogarea datelor."
+    
+    data = response.json()
+    
+    # Map node IDs to names
+    id_to_name = {}
+    for elem in data['elements']:
+        if elem['type'] == 'node' and 'tags' in elem and 'name' in elem['tags']:
+            id_to_name[elem['id']] = elem['tags']['name']
+    
+    routes = []
+    
+    for elem in data['elements']:
+        if elem['type'] == 'relation':
+            tags = elem['tags']
+            ref = tags.get('ref', tags.get('name', 'necunoscută'))
+            stops_in_route = []
+            
+            for member in elem['members']:
+                if member['type'] == 'node' and member['role'].startswith('platform'):
+                    node_id = member['ref']
+                    name = id_to_name.get(node_id)
+                    if name:
+                        stops_in_route.append(name)
+            
+            if from_stop in stops_in_route and to_stop in stops_in_route:
+                try:
+                    idx_from = stops_in_route.index(from_stop)
+                    idx_to = stops_in_route.index(to_stop)
+                    
+                    if idx_from < idx_to:
+                        intermediate = stops_in_route[idx_from + 1: idx_to]
+                        route_info = f"Linia {ref}: {' -> '.join([from_stop] + intermediate + [to_stop])}"
+                        routes.append(route_info)
+                except ValueError:
+                    pass
+    
+    if routes:
+        return "\n\n".join(routes)
+    else:
+        return "Nu există un traseu direct cu autobuzul între stațiile selectate."
 
-# Extragem numele stațiilor și coordonatele (lat, lon)
-bus_stops = []
-seen_names = set()
-for element in data['elements']:
-    if 'tags' in element and 'name' in element['tags']:
-        name = element['tags']['name'].strip()
-        if name not in seen_names:
-            seen_names.add(name)
-            lat = element['lat']
-            lon = element['lon']
-            bus_stops.append((name, lat, lon))
+with gr.Blocks() as app:
+    gr.Markdown("### Aplicație pentru trasee de autobuz în Bistrița")
+    
+    from_dropdown = gr.Dropdown(choices=stops_list, label="Stație de plecare")
+    to_dropdown = gr.Dropdown(choices=stops_list, label="Stație de sosire")
+    output = gr.Textbox(label="Informații traseu", lines=10)
+    
+    btn = gr.Button("Căutare traseu")
+    btn.click(find_route, inputs=[from_dropdown, to_dropdown], outputs=output)
 
-# Sortăm alfabetic pentru o listă ordonată
-bus_stops.sort(key=lambda x: x[0])
-stop_names = [stop[0] for stop in bus_stops]
-
-# Dicționar pentru acces rapid la coordonate
-stop_coords = {name: (lat, lon) for name, lat, lon in bus_stops}
-
-def gaseste_ruta(start, destinatie):
-    if start == destinatie:
-        return "Stația de plecare și destinația sunt aceleași."
-    
-    if start not in stop_coords or destinatie not in stop_coords:
-        return "Una dintre stații nu a fost găsită în baza de date."
-    
-    start_lat, start_lon = stop_coords[start]
-    destin_lat, destin_lon = stop_coords[destinatie]
-    
-    # Apel către OSRM (Open Source Routing Machine) - profil public_transport (include autobuze unde sunt mapate)
-    osrm_url = "http://router.project-osrm.org/route/v1/public_transport/"
-    coords = f"{start_lon},{start_lat};{destin_lon},{destin_lat}"
-    params = {
-        "overview": "full",
-        "geometries": "geojson",
-        "steps": "true"
-    }
-    
-    osrm_response = requests.get(osrm_url + coords, params=params)
-    
-    if osrm_response.status_code != 200:
-        return "Eroare la comunicarea cu serviciul de rutare."
-    
-    osrm_data = osrm_response.json()
-    
-    if osrm_data.get("code") != "Ok" or not osrm_data.get("routes"):
-        return ("Nu s-a găsit nicio rută cu transport public între aceste stații.\n"
-                "Notă: Datele de transport public în OpenStreetMap pentru Bistrița sunt limitate, "
-                "deci este posibil să existe rute în realitate care nu sunt mapate complet.")
-    
-    route = osrm_data["routes"][0]
-    durata = route["duration"] / 60  # în minute
-    distanta = route["distance"] / 1000  # în km
-    
-    rezultat = f"**Durată estimată:** {durata:.1f} minute\n"
-    rezultat += f"**Distanță:** {distanta:.1f} km\n\n"
-    rezultat += "**Pași detaliați:**\n"
-    
-    for leg in route["legs"]:
-        for step in leg["steps"]:
-            instruction = step.get("instruction", "Continuați")
-            if "name" in step:
-                instruction += f" pe {step['name']}"
-            distance_step = step["distance"] / 1000
-            duration_step = step["duration"] / 60
-            mode = step.get("mode", "unknown")
-            if mode == "walking":
-                rezultat += f"- Mergeți pe jos {distance_step:.2f} km ({duration_step:.1f} min): {instruction}\n"
-            elif mode in ["bus", "public_transport"]:
-                rezultat += f"- Luați autobuzul {distance_step:.2f} km ({duration_step:.1f} min): {instruction}\n"
-            else:
-                rezultat += f"- {mode.capitalize()}: {instruction} ({distance_step:.2f} km, {duration_step:.1f} min)\n"
-    
-    return rezultat
-
-with gr.Blocks(title="Transport public Bistrița", theme=gr.themes.Soft()) as app:
-    gr.Markdown("# Cum să ajung cu autobuzul în Bistrița")
-    gr.Markdown("Selectați stația de plecare și destinația. Aplicația utilizează date OpenStreetMap și OSRM pentru a calcula ruta cu transport public (unde datele sunt disponibile).")
-    
-    with gr.Row():
-        start_input = gr.Dropdown(choices=stop_names, label="Stație de plecare")
-        dest_input = gr.Dropdown(choices=stop_names, label="Stație destinație")
-    
-    btn = gr.Button("Caută ruta")
-    output = gr.Textbox(label="Rezultat")
-    
-    btn.click(fn=gaseste_ruta, inputs=[start_input, dest_input], outputs=output)
-
-app.launch()
+if __name__ == "__main__":
+    app.launch()
