@@ -1,94 +1,111 @@
 import gradio as gr
 import requests
-from bs4 import BeautifulSoup
-import datetime
 import json
-import re
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+# Coordonatele aproximative pentru orașul Bistrița (pentru a limita căutarea la zonă relevantă)
+BISTRITA_BBOX = "47.08,24.42,47.18,24.58"  # south, west, north, east
 
-def extract_next_data(html):
-    m = re.search(r'__NEXT_DATA__\s*=\s*({.*?})</script>', html, re.S)
-    if not m:
-        return None
-    return json.loads(m.group(1))
+# Query Overpass API pentru toate stațiile de autobuz din Bistrița
+# Folosim atât tag-ul clasic highway=bus_stop, cât și public_transport=platform cu bus=yes
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+QUERY = f"""
+[out:json];
+(
+  node["highway"="bus_stop"]({BISTRITA_BBOX});
+  node["public_transport"="platform"]["bus"="yes"]({BISTRITA_BBOX});
+);
+out body;
+"""
 
-def get_next_arrivals(station):
-    stops_url = "https://moovitapp.com/index/en/public_transit-stops-Bistri%C8%9Ba-4880"
+response = requests.get(OVERPASS_URL, params={'data': QUERY})
+data = response.json()
 
-    r = requests.get(stops_url, headers=HEADERS, timeout=15)
-    if r.status_code != 200:
-        return f"Failed to access stops list (HTTP {r.status_code})."
+# Extragem numele stațiilor și coordonatele (lat, lon)
+bus_stops = []
+seen_names = set()
+for element in data['elements']:
+    if 'tags' in element and 'name' in element['tags']:
+        name = element['tags']['name'].strip()
+        if name not in seen_names:
+            seen_names.add(name)
+            lat = element['lat']
+            lon = element['lon']
+            bus_stops.append((name, lat, lon))
 
-    data = extract_next_data(r.text)
-    if not data:
-        return "Stops list loaded dynamically and cannot be parsed."
+# Sortăm alfabetic pentru o listă ordonată
+bus_stops.sort(key=lambda x: x[0])
+stop_names = [stop[0] for stop in bus_stops]
 
-    stops = {}
-    for page in json.dumps(data):
-        pass
+# Dicționar pentru acces rapid la coordonate
+stop_coords = {name: (lat, lon) for name, lat, lon in bus_stops}
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    for a in soup.select("a[href*='-stop_']"):
-        name = a.get_text(strip=True)
-        if name:
-            stops[name] = "https://moovitapp.com" + a["href"]
+def gaseste_ruta(start, destinatie):
+    if start == destinatie:
+        return "Stația de plecare și destinația sunt aceleași."
+    
+    if start not in stop_coords or destinatie not in stop_coords:
+        return "Una dintre stații nu a fost găsită în baza de date."
+    
+    start_lat, start_lon = stop_coords[start]
+    destin_lat, destin_lon = stop_coords[destinatie]
+    
+    # Apel către OSRM (Open Source Routing Machine) - profil public_transport (include autobuze unde sunt mapate)
+    osrm_url = "http://router.project-osrm.org/route/v1/public_transport/"
+    coords = f"{start_lon},{start_lat};{destin_lon},{destin_lat}"
+    params = {
+        "overview": "full",
+        "geometries": "geojson",
+        "steps": "true"
+    }
+    
+    osrm_response = requests.get(osrm_url + coords, params=params)
+    
+    if osrm_response.status_code != 200:
+        return "Eroare la comunicarea cu serviciul de rutare."
+    
+    osrm_data = osrm_response.json()
+    
+    if osrm_data.get("code") != "Ok" or not osrm_data.get("routes"):
+        return ("Nu s-a găsit nicio rută cu transport public între aceste stații.\n"
+                "Notă: Datele de transport public în OpenStreetMap pentru Bistrița sunt limitate, "
+                "deci este posibil să existe rute în realitate care nu sunt mapate complet.")
+    
+    route = osrm_data["routes"][0]
+    durata = route["duration"] / 60  # în minute
+    distanta = route["distance"] / 1000  # în km
+    
+    rezultat = f"**Durată estimată:** {durata:.1f} minute\n"
+    rezultat += f"**Distanță:** {distanta:.1f} km\n\n"
+    rezultat += "**Pași detaliați:**\n"
+    
+    for leg in route["legs"]:
+        for step in leg["steps"]:
+            instruction = step.get("instruction", "Continuați")
+            if "name" in step:
+                instruction += f" pe {step['name']}"
+            distance_step = step["distance"] / 1000
+            duration_step = step["duration"] / 60
+            mode = step.get("mode", "unknown")
+            if mode == "walking":
+                rezultat += f"- Mergeți pe jos {distance_step:.2f} km ({duration_step:.1f} min): {instruction}\n"
+            elif mode in ["bus", "public_transport"]:
+                rezultat += f"- Luați autobuzul {distance_step:.2f} km ({duration_step:.1f} min): {instruction}\n"
+            else:
+                rezultat += f"- {mode.capitalize()}: {instruction} ({distance_step:.2f} km, {duration_step:.1f} min)\n"
+    
+    return rezultat
 
-    matches = [n for n in stops if station.lower() in n.lower()]
-    if not matches:
-        return "No matching station found."
-    if len(matches) > 1:
-        return "Multiple stations found: " + ", ".join(matches)
+with gr.Blocks(title="Transport public Bistrița", theme=gr.themes.Soft()) as app:
+    gr.Markdown("# Cum să ajung cu autobuzul în Bistrița")
+    gr.Markdown("Selectați stația de plecare și destinația. Aplicația utilizează date OpenStreetMap și OSRM pentru a calcula ruta cu transport public (unde datele sunt disponibile).")
+    
+    with gr.Row():
+        start_input = gr.Dropdown(choices=stop_names, label="Stație de plecare")
+        dest_input = gr.Dropdown(choices=stop_names, label="Stație destinație")
+    
+    btn = gr.Button("Caută ruta")
+    output = gr.Textbox(label="Rezultat")
+    
+    btn.click(fn=gaseste_ruta, inputs=[start_input, dest_input], outputs=output)
 
-    stop_name = matches[0]
-    stop_url = stops[stop_name]
-
-    r = requests.get(stop_url, headers=HEADERS, timeout=15)
-    if r.status_code != 200:
-        return f"Failed to access stop page (HTTP {r.status_code})."
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table")
-    if not table:
-        return "No schedule table found."
-
-    now = datetime.datetime.now().time()
-    next_lines = {}
-
-    for row in table.select("tr")[1:]:
-        cells = [c.get_text(strip=True) for c in row.select("td")]
-        if len(cells) < 3:
-            continue
-        try:
-            h, m = map(int, cells[2].split(":"))
-            t = datetime.time(h, m)
-        except Exception:
-            continue
-
-        if t > now:
-            line = cells[0]
-            if line not in next_lines or t < next_lines[line][0]:
-                next_lines[line] = (t, cells[1])
-
-    if not next_lines:
-        return "No upcoming buses found."
-
-    out = f"Next arrivals at {stop_name}:\n\n"
-    for line in sorted(next_lines):
-        t, d = next_lines[line]
-        out += f"Line {line} → {d}: {t.strftime('%H:%M')}\n"
-
-    return out
-
-app = gr.Interface(
-    fn=get_next_arrivals,
-    inputs=gr.Textbox(label="Bus Station in Bistrița"),
-    outputs="text",
-    title="Bistrița Bus Next Arrivals",
-)
-
-if __name__ == "__main__":
-    print("This app is not (yet) functional.")
+app.launch()
