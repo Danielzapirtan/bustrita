@@ -91,4 +91,4 @@ app = gr.Interface(
 )
 
 if __name__ == "__main__":
-    print "This app is not (yet) functional.
+    print "This app is not (yet) functional."
