@@ -1,11 +1,10 @@
-import gradio as gr
 import requests
 
 def fetch_stops():
     overpass_url = "https://overpass-api.de/api/interpreter"
     query = '''
     [out:json][timeout:25];
-    area["name"="Bistrița"]["admin_level"="8"]->.searchArea;
+    area["name"="București"]["admin_level"="4"]->.searchArea;
     node(area.searchArea)["highway"="bus_stop"]["name"];
     out body;
     '''
@@ -33,7 +32,7 @@ def find_route(from_stop, to_stop):
     overpass_url = "https://overpass-api.de/api/interpreter"
     query = '''
     [out:json][timeout:25];
-    area["name"="Bistrița"]["admin_level"="8"]->.searchArea;
+    area["name"="București"]["admin_level"="4"]->.searchArea;
     rel(area.searchArea)["type"="route"]["route"="bus"];
     out body;
     >;
@@ -86,7 +85,7 @@ def find_route(from_stop, to_stop):
         return "Nu există un traseu direct cu autobuzul între stațiile selectate."
 
 with gr.Blocks() as app:
-    gr.Markdown("### Aplicație pentru trasee de autobuz în Bistrița")
+    gr.Markdown("### Aplicație pentru trasee de autobuz în București")
     
     from_dropdown = gr.Dropdown(choices=stops_list, label="Stație de plecare")
     to_dropdown = gr.Dropdown(choices=stops_list, label="Stație de sosire")
