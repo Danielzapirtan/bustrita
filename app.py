@@ -1,102 +1,97 @@
 import gradio as gr
 import requests
 
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
 def fetch_stops():
-    overpass_url = "https://overpass-api.de/api/interpreter"
-    query = '''
-    [out:json][timeout:25];
-    area["name"="București"]["admin_level"="4"]->.searchArea;
-    node(area.searchArea)["highway"="bus_stop"]["name"];
-    out body;
-    '''
-    response = requests.post(overpass_url, data={'data': query})
-    
-    if response.status_code != 200:
-        return []
-    
-    data = response.json()
-    names = set()
-    
-    for elem in data['elements']:
-        name = elem['tags'].get('name')
+    query = """
+    [out:json][timeout:90];
+    area["name"="Bistrița"]["admin_level"="8"]["boundary"="administrative"]->.a;
+    (
+      node(area.a)["public_transport"="stop_position"]["bus"="yes"];
+      node(area.a)["highway"="bus_stop"];
+      node(area.a)["public_transport"="platform"]["bus"="yes"];
+      way(area.a)["public_transport"="platform"]["bus"="yes"];
+      relation(area.a)["public_transport"="stop_area"];
+    );
+    out geom;
+    """
+    try:
+        r = requests.post(OVERPASS_URL, data={"data": query})
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return ["Eroare la preluarea stațiilor: " + str(e)]
+
+    stops = set()
+    for e in data["elements"]:
+        name = e.get("tags", {}).get("name") or e.get("tags", {}).get("local_ref")
         if name:
-            names.add(name)
-    
-    return sorted(names)
+            stops.add(name)
+
+    return sorted(stops) if stops else ["Nicio stație găsită"]
+
 
 stops_list = fetch_stops()
 
+
 def find_route(from_stop, to_stop):
     if from_stop == to_stop:
-        return "Stațiile de plecare și sosire sunt identice."
-    
-    overpass_url = "https://overpass-api.de/api/interpreter"
-    query = '''
-    [out:json][timeout:25];
-    area["name"="București"]["admin_level"="4"]->.searchArea;
-    rel(area.searchArea)["type"="route"]["route"="bus"];
-    out body;
-    >;
-    out skel qt;
-    '''
-    
-    response = requests.post(overpass_url, data={'data': query})
-    
-    if response.status_code != 200:
-        return "A apărut o eroare la interogarea datelor."
-    
-    data = response.json()
-    
-    # Map node IDs to names
-    id_to_name = {}
-    for elem in data['elements']:
-        if elem['type'] == 'node' and 'tags' in elem and 'name' in elem['tags']:
-            id_to_name[elem['id']] = elem['tags']['name']
-    
-    routes = []
-    
-    for elem in data['elements']:
-        if elem['type'] == 'relation':
-            tags = elem['tags']
-            ref = tags.get('ref', tags.get('name', 'necunoscută'))
-            stops_in_route = []
-            
-            for member in elem['members']:
-                # Accept nodes with role 'stop', 'platform', or empty role
-                if member['type'] == 'node':
-                    role = member.get('role', '')
-                    if role in ['stop', 'platform', ''] or role.startswith('platform') or role.startswith('stop'):
-                        node_id = member['ref']
-                        name = id_to_name.get(node_id)
-                        if name:
-                            stops_in_route.append(name)
-            
-            if from_stop in stops_in_route and to_stop in stops_in_route:
-                try:
-                    idx_from = stops_in_route.index(from_stop)
-                    idx_to = stops_in_route.index(to_stop)
-                    
-                    if idx_from < idx_to:
-                        intermediate = stops_in_route[idx_from + 1: idx_to]
-                        route_info = f"Linia {ref}: {' -> '.join([from_stop] + intermediate + [to_stop])}"
-                        routes.append(route_info)
-                except ValueError:
-                    pass
-    
-    if routes:
-        return "\n\n".join(routes)
-    else:
-        return "Nu există un traseu direct cu autobuzul între stațiile selectate."
+        return "Stațiile sunt identice."
+    if not from_stop or not to_stop:
+        return "Selectați ambele stații."
+
+    query = """
+    [out:json][timeout:180];
+    area["name"="Bistrița"]["admin_level"="8"]["boundary"="administrative"]->.a;
+    relation(area.a)["type"="route"]["route"="bus"]->.routes;
+    (.routes; .routes >; .routes >>;);
+    out geom;
+    """
+    try:
+        r = requests.post(OVERPASS_URL, data={"data": query})
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return "Eroare API: " + str(e)
+
+    # Map element IDs to names
+    name_map = {}
+    for e in data["elements"]:
+        if "name" in e.get("tags", {}):
+            name_map[e["id"]] = e["tags"]["name"]
+
+    routes_found = []
+    for rel in [e for e in data["elements"] if e["type"] == "relation" and e.get("tags", {}).get("type") == "route"]:
+        ref = rel.get("tags", {}).get("ref", rel.get("tags", {}).get("name", "?"))
+        stops = []
+        for m in rel.get("members", []):
+            if m["role"] in {"platform", "stop", "platform_entry_only", "platform_exit_only", "stop_entry_only", "stop_exit_only", ""}:
+                name = name_map.get(m["ref"])
+                if name:
+                    stops.append(name)
+
+        if from_stop in stops and to_stop in stops:
+            i1 = stops.index(from_stop)
+            i2 = stops.index(to_stop)
+            if i1 < i2:
+                segment = " → ".join(stops[i1:i2 + 1])
+                routes_found.append(f"Linia {ref}: {segment}")
+            elif i2 < i1:  # Check reverse for completeness
+                segment = " → ".join(stops[i2:i1 + 1][::-1])
+                routes_found.append(f"Linia {ref} (sens opus): {segment}")
+
+    return "\n\n".join(routes_found) if routes_found else "Niciun traseu direct găsit."
+
 
 with gr.Blocks() as app:
-    gr.Markdown("### Aplicație pentru trasee de autobuz în București")
-    
-    from_dropdown = gr.Dropdown(choices=stops_list, label="Stație de plecare")
-    to_dropdown = gr.Dropdown(choices=stops_list, label="Stație de sosire")
-    output = gr.Textbox(label="Informații traseu", lines=10)
-    
-    btn = gr.Button("Căutare traseu")
-    btn.click(find_route, inputs=[from_dropdown, to_dropdown], outputs=output)
+    gr.Markdown("### Trasee autobuz Bistrița (OpenStreetMap)")
+
+    f = gr.Dropdown(stops_list, label="Stație plecare")
+    t = gr.Dropdown(stops_list, label="Stație sosire")
+    out = gr.Textbox(lines=10, label="Rezultate")
+
+    gr.Button("Caută").click(find_route, [f, t], out)
 
 if __name__ == "__main__":
     app.launch()
