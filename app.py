@@ -1,3 +1,4 @@
+import gradio as gr
 import requests
 
 def fetch_stops():
@@ -61,11 +62,14 @@ def find_route(from_stop, to_stop):
             stops_in_route = []
             
             for member in elem['members']:
-                if member['type'] == 'node' and member['role'].startswith('platform'):
-                    node_id = member['ref']
-                    name = id_to_name.get(node_id)
-                    if name:
-                        stops_in_route.append(name)
+                # Accept nodes with role 'stop', 'platform', or empty role
+                if member['type'] == 'node':
+                    role = member.get('role', '')
+                    if role in ['stop', 'platform', ''] or role.startswith('platform') or role.startswith('stop'):
+                        node_id = member['ref']
+                        name = id_to_name.get(node_id)
+                        if name:
+                            stops_in_route.append(name)
             
             if from_stop in stops_in_route and to_stop in stops_in_route:
                 try:
